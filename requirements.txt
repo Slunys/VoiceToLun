@@ -6,3 +6,4 @@ pynput
 customtkinter
 pystray
 Pillow
+pyperclip

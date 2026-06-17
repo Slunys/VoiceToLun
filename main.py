@@ -5,6 +5,7 @@ from pynput import keyboard
 from pynput.keyboard import Controller
 from faster_whisper import WhisperModel
 import os
+import sys
 import queue
 import threading
 import time
@@ -12,6 +13,8 @@ import customtkinter as ctk
 import json
 import pystray
 from PIL import Image, ImageDraw
+import pyperclip
+import winreg
 
 # --- Настройки и Конфиг ---
 CONFIG_FILE = "config.json"
@@ -21,30 +24,55 @@ MODEL_DIR = os.path.join(os.getcwd(), "whisper_models")
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 
 
-# Загрузка или создание конфига для сохранения кнопки
 def load_config():
     if os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE, "r") as f:
-            return json.load(f).get("hotkey", "Key.f20")
-    return "Key.f20"
+            data = json.load(f)
+            return data.get("hotkey", "Key.f20"), data.get("autostart", False)
+    return "Key.f20", False
 
 
-def save_config(hotkey_str):
+def save_config(hotkey_str, autostart_bool):
     with open(CONFIG_FILE, "w") as f:
-        json.dump({"hotkey": hotkey_str}, f)
+        json.dump({"hotkey": hotkey_str, "autostart": autostart_bool}, f)
 
 
-current_hotkey_str = load_config()
+current_hotkey_str, current_autostart = load_config()
 
-# --- Инициализация ИИ и периферии ---
+
+# --- Логика Автозапуска (Windows Registry) ---
+def set_autostart(enable):
+    key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
+    app_name = "VoiceTypingApp"
+    # Получаем абсолютный путь к запущенному файлу (скрипту или .exe)
+    exe_path = os.path.abspath(sys.argv[0])
+
+    try:
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_ALL_ACCESS)
+        if enable:
+            winreg.SetValueEx(key, app_name, 0, winreg.REG_SZ, f'"{exe_path}"')
+        else:
+            try:
+                winreg.DeleteValue(key, app_name)
+            except FileNotFoundError:
+                pass  # Если ключа и так нет, игнорируем
+        winreg.CloseKey(key)
+    except Exception as e:
+        print(f"[❌] Ошибка реестра: {e}")
+
+
+# Применяем автозапуск при старте, если он был включен
+if current_autostart:
+    set_autostart(True)
+
+# --- Инициализация ИИ ---
 print("[⚙️] Загрузка модели...")
 model = WhisperModel(MODEL_SIZE, device="cpu", compute_type="int8", download_root=MODEL_DIR)
 keyboard_controller = Controller()
 
-# --- Переменные состояния ---
 is_recording = False
 continuous_mode = False
-is_rebinding = False  # Флаг для режима "Слушаю новую кнопку"
+is_rebinding = False
 audio_queue = queue.Queue()
 double_tap_timer = None
 press_start_time = 0
@@ -54,23 +82,22 @@ press_duration = 0
 ctk.set_appearance_mode("dark")
 app = ctk.CTk()
 app.title("VoiceTyping")
-app.geometry("350x210")
+app.geometry("350x270")  # Чуть увеличили окно под тумблер
 app.resizable(False, False)
 
-# Элементы интерфейса
 status_label = ctk.CTkLabel(app, text="🟢 Готово к работе", font=("Arial", 20, "bold"), text_color="#2ecc71")
 status_label.pack(pady=(20, 10))
 
-info_label = ctk.CTkLabel(app, text="Удерживайте кнопку для диктовки,\nили нажмите дважды чтобы перейти в режим записи", font=("Arial", 12))
-info_label.pack(pady=(0, 20))
+info_label = ctk.CTkLabel(app, text="Удерживайте кнопку для диктовки,\nили нажмите дважды для постоянной записи",
+                          font=("Arial", 12))
+info_label.pack(pady=(0, 15))
 
-current_key_label = ctk.CTkLabel(app, text=f"Текущая кнопка: {current_hotkey_str.replace('Key.', '').upper()}",
+current_key_label = ctk.CTkLabel(app, text=f"Кнопка: {current_hotkey_str.replace('Key.', '').upper()}",
                                  font=("Arial", 14))
 current_key_label.pack(pady=5)
 
 
 def update_status(text, color):
-    # Безопасное обновление UI из других потоков
     app.after(0, lambda: status_label.configure(text=text, text_color=color))
 
 
@@ -82,25 +109,37 @@ def start_rebind():
 
 
 btn_rebind = ctk.CTkButton(app, text="Изменить кнопку", command=start_rebind)
-btn_rebind.pack(pady=15)
+btn_rebind.pack(pady=10)
 
 
-# --- Логика Системного Трея (Сворачивание) ---
+def toggle_autostart():
+    global current_autostart
+    current_autostart = autostart_var.get()
+    save_config(current_hotkey_str, current_autostart)
+    set_autostart(current_autostart)
+
+
+autostart_var = ctk.BooleanVar(value=current_autostart)
+switch_autostart = ctk.CTkSwitch(app, text="Автозапуск с Windows", variable=autostart_var, command=toggle_autostart)
+switch_autostart.pack(pady=10)
+
+
+# --- Логика Системного Трея ---
 def hide_window():
-    """Скрывает окно при нажатии на крестик"""
     app.withdraw()
 
-# Перехватываем стандартное закрытие окна по крестику
+
 app.protocol('WM_DELETE_WINDOW', hide_window)
 
+
 def show_window(icon, item):
-    """Возвращает окно на экран (безопасно для UI)"""
     app.after(0, app.deiconify)
 
+
 def quit_app(icon, item):
-    """Полностью убивает процесс программы"""
     icon.stop()
     os._exit(0)
+
 
 def create_icon_image():
     image = Image.new('RGB', (64, 64), color=(30, 30, 30))
@@ -108,17 +147,17 @@ def create_icon_image():
     dc.ellipse((16, 16, 48, 48), fill=(220, 50, 50))
     return image
 
+
 def start_tray():
-    """Запускает иконку в трее"""
     menu = pystray.Menu(
-        pystray.MenuItem('Показать окно', show_window, default=True), # default=True делает реакцию на двойной клик по иконке
+        pystray.MenuItem('Показать окно', show_window, default=True),
         pystray.MenuItem('Выход', quit_app)
     )
     tray_icon = pystray.Icon("VoiceTyping", create_icon_image(), "Voice Typing", menu=menu)
     tray_icon.run()
 
 
-# --- Логика Аудио ---
+# --- Логика Аудио и Вставка ---
 def audio_callback(indata, frames, time, status):
     if is_recording:
         audio_queue.put(indata.copy())
@@ -174,12 +213,23 @@ def process_and_type_logic(is_continuous_stop=False):
         os.remove(temp_path)
 
     if text:
-        keyboard_controller.type(text + " ")
+        # МОМЕНТАЛЬНАЯ ВСТАВКА ЧЕРЕЗ БУФЕР ОБМЕНА
+        old_clipboard = pyperclip.paste()  # Сохраняем старый буфер
+        pyperclip.copy(text + " ")  # Кидаем новый текст
+
+        # Эмулируем Ctrl+V
+        keyboard_controller.press(keyboard.Key.ctrl)
+        keyboard_controller.press('v')
+        keyboard_controller.release('v')
+        keyboard_controller.release(keyboard.Key.ctrl)
+
+        time.sleep(0.6)
+
+        pyperclip.copy(old_clipboard)  # Возвращаем старый буфер
 
     update_status("🟢 Готово к работе", "#2ecc71")
 
 
-# Обертка для запуска обработки в фоне (чтобы окно не висло)
 def process_and_type(is_continuous_stop=False):
     threading.Thread(target=process_and_type_logic, args=(is_continuous_stop,)).start()
 
@@ -187,23 +237,17 @@ def process_and_type(is_continuous_stop=False):
 # --- Перехват Клавиатуры ---
 def on_press(key):
     global continuous_mode, double_tap_timer, press_start_time, is_recording, is_rebinding, current_hotkey_str
-
     key_str = str(key)
 
-    # Режим назначения новой кнопки
     if is_rebinding:
         current_hotkey_str = key_str
-        save_config(current_hotkey_str)
-
-        # Обновляем UI
-        app.after(0, lambda: current_key_label.configure(text=f"Текущая кнопка: {key_str.replace('Key.', '').upper()}"))
+        save_config(current_hotkey_str, current_autostart)
+        app.after(0, lambda: current_key_label.configure(text=f"Кнопка: {key_str.replace('Key.', '').upper()}"))
         update_status("🟢 Готово к работе", "#2ecc71")
         app.after(0, lambda: btn_rebind.configure(state="normal"))
-
         is_rebinding = False
         return
 
-    # Обычный режим работы
     if key_str == current_hotkey_str:
         if continuous_mode:
             process_and_type(is_continuous_stop=True)
@@ -229,8 +273,10 @@ def on_release(key):
 
 # --- Запуск всех потоков ---
 threading.Thread(target=start_tray, daemon=True).start()
+
 keyboard_listener = keyboard.Listener(on_press=on_press, on_release=on_release)
 keyboard_listener.start()
+
 audio_stream = sd.InputStream(samplerate=SAMPLE_RATE, channels=1, callback=audio_callback)
 audio_stream.start()
 
